@@ -55,6 +55,7 @@ class VidaaDevice(PollingDevice):
         super().__init__(device_config, poll_interval=POLL_INTERVAL, **kwargs)
         self._device_config = device_config
         self._tv: AsyncVidaaTV | None = None
+        self._connect_lock: asyncio.Lock = asyncio.Lock()
 
         self._state: str = "UNAVAILABLE"
         self._tv_on: bool = False
@@ -152,50 +153,63 @@ class VidaaDevice(PollingDevice):
 
     async def establish_connection(self) -> AsyncVidaaTV:
         _LOG.info("[%s] Establishing connection", self.log_id)
-        self._tv = AsyncVidaaTV(
-            host=self._device_config.host,
-            port=self._device_config.port,
-            use_dynamic_auth=True,
-            mac_address=self._device_config.mac or None,
-            enable_persistence=True,
-            storage=get_token_storage(),
-        )
+        # A single MQTT client must be used for the device's lifetime. Creating
+        # a second client (same MQTT client ID) makes the TV kick the first
+        # session, and the two paho reconnect loops then fight forever.
+        async with self._connect_lock:
+            if self._tv is None:
+                self._tv = AsyncVidaaTV(
+                    host=self._device_config.host,
+                    port=self._device_config.port,
+                    use_dynamic_auth=True,
+                    mac_address=self._device_config.mac or None,
+                    enable_persistence=True,
+                    storage=get_token_storage(),
+                )
 
-        connected = False
-        try:
-            connected = await self._tv.async_connect(timeout=10)
-        except Exception as err:
-            _LOG.debug("[%s] Connect attempt failed: %s", self.log_id, err)
+            connected = self._tv.is_connected
+            if not connected:
+                try:
+                    connected = await self._tv.async_connect(timeout=10)
+                except Exception as err:
+                    _LOG.debug("[%s] Connect attempt failed: %s", self.log_id, err)
 
-        if connected:
+            if connected:
+                try:
+                    await self._refresh_device_info()
+                    await self._refresh_lists()
+                    await self._update_state()
+                except Exception as err:
+                    _LOG.warning("[%s] Initial state query failed: %s", self.log_id, err)
+                self._state = "ON" if self._tv_on else "OFF"
+                _LOG.info("[%s] Connection established (TV %s)", self.log_id, self._state)
+            else:
+                # TV is unreachable (likely powered off) - keep entities available
+                # so the user can still power it on via Wake-on-LAN.
+                self._tv_on = False
+                self._state = "OFF"
+                _LOG.info("[%s] TV unreachable, assuming powered off", self.log_id)
+
+            return self._tv
+
+    async def _reconnect(self, timeout: float = 5) -> bool:
+        async with self._connect_lock:
+            if not self._tv:
+                return False
+            if self._tv.is_connected:
+                return True
             try:
-                await self._refresh_device_info()
-                await self._refresh_lists()
-                await self._update_state()
+                return await self._tv.async_connect(timeout=timeout)
             except Exception as err:
-                _LOG.warning("[%s] Initial state query failed: %s", self.log_id, err)
-            self._state = "ON" if self._tv_on else "OFF"
-            _LOG.info("[%s] Connection established (TV %s)", self.log_id, self._state)
-        else:
-            # TV is unreachable (likely powered off) - keep entities available
-            # so the user can still power it on via Wake-on-LAN.
-            self._tv_on = False
-            self._state = "OFF"
-            _LOG.info("[%s] TV unreachable, assuming powered off", self.log_id)
-
-        return self._tv
+                _LOG.debug("[%s] Reconnect failed: %s", self.log_id, err)
+                return False
 
     async def poll_device(self) -> None:
         if not self._tv:
             return
         try:
             if not self._tv.is_connected:
-                connected = False
-                try:
-                    connected = await self._tv.async_connect(timeout=5)
-                except Exception as err:
-                    _LOG.debug("[%s] Reconnect failed: %s", self.log_id, err)
-                if not connected:
+                if not await self._reconnect():
                     if self._state != "OFF":
                         _LOG.info("[%s] TV is now OFF or unreachable", self.log_id)
                     self._tv_on = False
@@ -286,12 +300,13 @@ class VidaaDevice(PollingDevice):
             _LOG.debug("[%s] App list query failed: %s", self.log_id, err)
 
     async def disconnect(self) -> None:
-        if self._tv:
-            try:
-                await self._tv.async_disconnect()
-            except Exception as err:
-                _LOG.debug("[%s] Disconnect error: %s", self.log_id, err)
-            self._tv = None
+        async with self._connect_lock:
+            if self._tv:
+                try:
+                    await self._tv.async_disconnect()
+                except Exception as err:
+                    _LOG.debug("[%s] Disconnect error: %s", self.log_id, err)
+                self._tv = None
         self._tv_on = False
         self._device_info_fetched = False
         self._state = "UNAVAILABLE"
@@ -321,7 +336,7 @@ class VidaaDevice(PollingDevice):
 
     async def power_off(self) -> bool:
         _LOG.info("[%s] Power off", self.log_id)
-        if not (self._tv and self._tv.is_connected):
+        if not await self._ensure_connected():
             return False
         try:
             await self._tv.async_power_off()
@@ -338,8 +353,16 @@ class VidaaDevice(PollingDevice):
             return await self.power_off()
         return await self.power_on()
 
+    async def _ensure_connected(self) -> bool:
+        """Make sure the client is connected before sending a command."""
+        if not self._tv:
+            return False
+        if self._tv.is_connected:
+            return True
+        return await self._reconnect()
+
     async def send_key(self, key: str) -> bool:
-        if not (self._tv and self._tv.is_connected):
+        if not await self._ensure_connected():
             _LOG.warning("[%s] Cannot send key %s: not connected", self.log_id, key)
             return False
         try:
@@ -349,7 +372,7 @@ class VidaaDevice(PollingDevice):
             return False
 
     async def set_volume(self, volume: int) -> bool:
-        if not (self._tv and self._tv.is_connected):
+        if not await self._ensure_connected():
             return False
         volume = max(0, min(100, int(volume)))
         try:
@@ -384,7 +407,7 @@ class VidaaDevice(PollingDevice):
         return ok
 
     async def select_source(self, source: str) -> bool:
-        if not (self._tv and self._tv.is_connected):
+        if not await self._ensure_connected():
             return False
 
         for src in self._sources:
@@ -420,7 +443,7 @@ class VidaaDevice(PollingDevice):
 
     async def set_input(self, source_key: str) -> bool:
         """Switch to an input by vidaa-control source key (e.g. 'hdmi1')."""
-        if not (self._tv and self._tv.is_connected):
+        if not await self._ensure_connected():
             return False
         ok = await self._set_source(source_key)
         if ok:
@@ -433,7 +456,7 @@ class VidaaDevice(PollingDevice):
         return ok
 
     async def launch_app(self, app_name: str) -> bool:
-        if not (self._tv and self._tv.is_connected):
+        if not await self._ensure_connected():
             return False
 
         target: Any = app_name
