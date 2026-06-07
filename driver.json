@@ -1,0 +1,39 @@
+{
+  "driver_id": "vidaa",
+  "version": "1.0.0",
+  "min_core_api": "0.22.0",
+  "name": {
+    "en": "VIDAA TV"
+  },
+  "icon": "uc:tv",
+  "description": {
+    "en": "Integration for Hisense VIDAA Smart TVs with media player, remote control, app launcher, input selection, and Wake-on-LAN power on"
+  },
+  "developer": {
+    "name": "Meir Miyara",
+    "email": "meir.miyara@gmail.com",
+    "url": "https://github.com/mase1981"
+  },
+  "home_page": "https://github.com/mase1981/uc-intg-vidaa",
+  "release_date": "2026-06-07",
+  "setup_data_schema": {
+    "title": {
+      "en": "VIDAA TV Setup"
+    },
+    "settings": [
+      {
+        "id": "info",
+        "label": {
+          "en": "Setup information"
+        },
+        "field": {
+          "label": {
+            "value": {
+              "en": "Make sure your VIDAA TV is powered ON, then enter its IP address on the next screen. A pairing PIN will appear on the TV screen during setup."
+            }
+          }
+        }
+      }
+    ]
+  }
+}

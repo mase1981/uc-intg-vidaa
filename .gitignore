@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.tar.gz
+*.egg-info/
+config.json
+vidaa_tokens.json
+*.log
+.idea/
+.DS_Store
+
+# Testing files (local only, never push)
+tests/
+simulator/
+
+# Claude (local only)
+.claude/
+knowledge-base/
+*.knowledge.md
+
+# VS Code
+.vscode/
