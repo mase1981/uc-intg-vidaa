@@ -14,6 +14,7 @@ from typing import Any
 
 from ucapi_framework import PollingDevice
 from vidaa import AsyncVidaaTV
+from vidaa.topics import TOPIC_SET_SOURCE, get_topic
 from vidaa.wol import wake_tv
 
 from uc_intg_vidaa.config import VidaaConfig, get_token_storage
@@ -406,22 +407,53 @@ class VidaaDevice(PollingDevice):
             self.push_update()
         return ok
 
+    def _find_source(self, query: str) -> dict[str, Any] | None:
+        """Find a TV source entry by display name or source name (space/case tolerant)."""
+        normalized = query.lower().replace(" ", "")
+        if not normalized:
+            return None
+        for src in self._sources:
+            for key in ("displayname", "sourcename"):
+                name = str(src.get(key) or "")
+                if name and name.lower().replace(" ", "") == normalized:
+                    return src
+        return None
+
+    async def _send_changesource(self, source: dict[str, Any]) -> bool:
+        """Publish changesource with the full source entry (id + name).
+
+        VIDAA firmwares ignore changesource for physical HDMI inputs unless
+        sourcename is sent alongside sourceid (vidaa-control only sends the id).
+        """
+        tv = self._tv
+        payload = {
+            "sourceid": source.get("sourceid"),
+            "sourcename": source.get("sourcename"),
+        }
+
+        def _send() -> bool:
+            client = tv._ensure_client()
+            topic = get_topic(TOPIC_SET_SOURCE, client.client_id)
+            return client._publish(topic, payload)
+
+        try:
+            return await tv._run_in_executor(_send)
+        except Exception as err:
+            _LOG.error("[%s] changesource failed: %s", self.log_id, err)
+            return False
+
     async def select_source(self, source: str) -> bool:
         if not await self._ensure_connected():
             return False
 
-        for src in self._sources:
-            if source in (src.get("displayname"), src.get("sourcename")):
-                source_id = src.get("sourceid")
-                target = str(source_id) if source_id is not None else str(
-                    src.get("sourcename", source)
-                ).lower()
-                ok = await self._set_source(target)
-                if ok:
-                    self._source = source
-                    self._app = ""
-                    self.push_update()
-                return ok
+        src = self._find_source(source)
+        if src:
+            ok = await self._send_changesource(src)
+            if ok:
+                self._source = src.get("displayname") or src.get("sourcename") or source
+                self._app = ""
+                self.push_update()
+            return ok
 
         source_key = INPUT_SOURCES.get(source)
         if source_key:
@@ -445,12 +477,21 @@ class VidaaDevice(PollingDevice):
         """Switch to an input by vidaa-control source key (e.g. 'hdmi1')."""
         if not await self._ensure_connected():
             return False
-        ok = await self._set_source(source_key)
+
+        src = self._find_source(source_key)
+        if src:
+            ok = await self._send_changesource(src)
+        else:
+            ok = await self._set_source(source_key)
+
         if ok:
-            for display, key in INPUT_SOURCES.items():
-                if key == source_key:
-                    self._source = display
-                    break
+            if src:
+                self._source = src.get("displayname") or src.get("sourcename") or source_key
+            else:
+                for display, key in INPUT_SOURCES.items():
+                    if key == source_key:
+                        self._source = display
+                        break
             self._app = ""
             self.push_update()
         return ok
