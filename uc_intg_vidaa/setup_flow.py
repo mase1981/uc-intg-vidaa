@@ -13,11 +13,11 @@ from typing import Any
 
 from ucapi import IntegrationSetupError, RequestUserInput, SetupError, UserDataResponse
 from ucapi_framework import BaseSetupFlow
-from vidaa import AsyncVidaaTV
+from vidaa import AsyncVidaaTV, async_discover_udp, async_probe_ip
 
 from uc_intg_vidaa.config import VidaaConfig, get_token_storage
 from uc_intg_vidaa.const import DEFAULT_PORT
-from uc_intg_vidaa.device import extract_mac_from_device_info
+from uc_intg_vidaa.device import _MAC_PATTERN
 
 _LOG = logging.getLogger(__name__)
 
@@ -31,40 +31,59 @@ class VidaaSetupFlow(BaseSetupFlow[VidaaConfig]):
         super().__init__(*args, **kwargs)
         self._pairing_tv: AsyncVidaaTV | None = None
         self._pin_attempts: int = 0
+        self._pairing_mac: str | None = None
+        self._mac_prompted: bool = False
 
     def get_manual_entry_form(self) -> RequestUserInput:
-        return RequestUserInput(
-            {"en": "VIDAA TV Setup"},
-            [
-                {
-                    "id": "info",
-                    "label": {"en": "Information"},
-                    "field": {
-                        "label": {
-                            "value": {
-                                "en": "Make sure the TV is powered ON before continuing. "
-                                "A pairing PIN will be displayed on the TV screen."
-                            }
+        self._mac_prompted = False
+        return self._build_entry_form()
+
+    def _build_entry_form(
+        self,
+        *,
+        error: str | None = None,
+        name: str = "VIDAA TV",
+        host: str = "",
+        mac: str = "",
+    ) -> RequestUserInput:
+        fields: list[dict[str, Any]] = []
+        if error:
+            fields.append({
+                "id": "error",
+                "label": {"en": "Error"},
+                "field": {"label": {"value": {"en": f"⚠️ {error}"}}},
+            })
+        fields.extend([
+            {
+                "id": "info",
+                "label": {"en": "Information"},
+                "field": {
+                    "label": {
+                        "value": {
+                            "en": "Make sure the TV is powered ON before continuing. "
+                            "A pairing PIN will be displayed on the TV screen. The MAC "
+                            "address is detected automatically - only enter it if asked."
                         }
-                    },
+                    }
                 },
-                {
-                    "id": "name",
-                    "label": {"en": "TV Name"},
-                    "field": {"text": {"value": "VIDAA TV"}},
-                },
-                {
-                    "id": "host",
-                    "label": {"en": "IP Address"},
-                    "field": {"text": {"value": ""}},
-                },
-                {
-                    "id": "mac",
-                    "label": {"en": "MAC Address (optional, for Wake-on-LAN)"},
-                    "field": {"text": {"value": ""}},
-                },
-            ],
-        )
+            },
+            {
+                "id": "name",
+                "label": {"en": "TV Name"},
+                "field": {"text": {"value": name}},
+            },
+            {
+                "id": "host",
+                "label": {"en": "IP Address"},
+                "field": {"text": {"value": host}},
+            },
+            {
+                "id": "mac",
+                "label": {"en": "MAC Address (auto-detected; for Wake-on-LAN)"},
+                "field": {"text": {"value": mac}},
+            },
+        ])
+        return RequestUserInput({"en": "VIDAA TV Setup"}, fields)
 
     async def _cleanup_pairing_client(self) -> None:
         if self._pairing_tv:
@@ -73,6 +92,66 @@ class VidaaSetupFlow(BaseSetupFlow[VidaaConfig]):
             except Exception:
                 pass
             self._pairing_tv = None
+
+    @staticmethod
+    def _normalize_mac(mac: str | None) -> str:
+        mac = (mac or "").strip().upper().replace("-", ":")
+        if ":" not in mac and len(mac) == 12:
+            mac = ":".join(mac[i : i + 2] for i in range(0, 12, 2))
+        return mac if _MAC_PATTERN.match(mac) else ""
+
+    async def _discover_mac(self, host: str) -> str:
+        """Resolve the TV MAC from the network without an authenticated session.
+
+        The MAC is required up front to generate dynamic MQTT credentials, so it
+        is read from the TV's own announcements - the UPnP descriptor first, then
+        the Vidaa UDP discovery response.
+        """
+        try:
+            device = await async_probe_ip(host, timeout=3)
+            if device and getattr(device, "mac", None):
+                mac = self._normalize_mac(device.mac)
+                if mac:
+                    return mac
+        except Exception as err:
+            _LOG.debug("UPnP MAC probe failed for %s: %s", host, err)
+
+        try:
+            found = await async_discover_udp(timeout=4)
+            device = found.get(host) if found else None
+            if device and getattr(device, "mac", None):
+                mac = self._normalize_mac(device.mac)
+                if mac:
+                    return mac
+        except Exception as err:
+            _LOG.debug("UDP MAC discovery failed for %s: %s", host, err)
+
+        return ""
+
+    async def _wait_for_token_persisted(self, timeout: float = 15.0) -> bool:
+        """Wait until the pairing access token is actually written to storage.
+
+        async_authenticate() returns as soon as the PIN is accepted, but the
+        access token is issued asynchronously on a separate topic. Completing
+        setup before it persists leaves the runtime session unauthenticated and
+        the TV silently ignores every command.
+        """
+        cfg = self._pending_device_config
+        if not cfg:
+            return False
+
+        storage = get_token_storage()
+        elapsed = 0.0
+        interval = 0.5
+        while elapsed < timeout:
+            status = await asyncio.to_thread(
+                storage.get_token_status, self._pairing_mac, cfg.host, DEFAULT_PORT
+            )
+            if status.get("has_token") and status.get("access_valid"):
+                return True
+            await asyncio.sleep(interval)
+            elapsed += interval
+        return False
 
     def _build_pin_screen(self, error: str | None = None) -> RequestUserInput:
         fields: list[dict[str, Any]] = []
@@ -109,12 +188,39 @@ class VidaaSetupFlow(BaseSetupFlow[VidaaConfig]):
             raise ValueError("IP address is required")
 
         name = input_values.get("name", "").strip() or f"VIDAA TV ({host})"
-        mac = input_values.get("mac", "").strip().upper().replace("-", ":")
+        mac = self._normalize_mac(input_values.get("mac", ""))
 
         _LOG.info("Setting up VIDAA TV at %s", host)
 
         await self._cleanup_pairing_client()
         self._pin_attempts = 0
+
+        if not mac:
+            mac = await self._discover_mac(host)
+            if mac:
+                _LOG.info("Discovered MAC %s for TV at %s", mac, host)
+            elif not self._mac_prompted:
+                self._mac_prompted = True
+                _LOG.warning(
+                    "Could not auto-discover MAC for %s; prompting for manual entry",
+                    host,
+                )
+                return self._build_entry_form(
+                    error=(
+                        "Could not auto-detect the TV's MAC address. Please enter it "
+                        "manually - you can find it in the TV's network/about settings."
+                    ),
+                    name=name,
+                    host=host,
+                )
+            else:
+                _LOG.warning(
+                    "Proceeding without a MAC for %s; pairing may fail on TVs that "
+                    "require dynamic authentication.",
+                    host,
+                )
+
+        self._pairing_mac = mac or None
 
         tv = AsyncVidaaTV(
             host=host,
@@ -149,9 +255,6 @@ class VidaaSetupFlow(BaseSetupFlow[VidaaConfig]):
                 name = device_info.get("tv_name") or name
                 model = device_info.get("model_name") or ""
                 sw_version = device_info.get("tv_version") or ""
-                info_mac = extract_mac_from_device_info(device_info)
-                if info_mac:
-                    mac = info_mac
         except Exception as err:
             _LOG.debug("Device info query failed during setup: %s", err)
 
@@ -236,14 +339,21 @@ class VidaaSetupFlow(BaseSetupFlow[VidaaConfig]):
                 self._pending_device_config.sw_version = (
                     device_info.get("tv_version") or self._pending_device_config.sw_version
                 )
-                info_mac = extract_mac_from_device_info(device_info)
-                if info_mac:
-                    self._pending_device_config.mac = info_mac
-                    self._pending_device_config.identifier = (
-                        f"vidaa_{info_mac.replace(':', '').lower()}"
-                    )
         except Exception as err:
             _LOG.debug("Device info query after pairing failed: %s", err)
 
+        if not await self._wait_for_token_persisted():
+            _LOG.warning("PIN accepted but no access token was persisted; re-prompting")
+            try:
+                await self._pairing_tv.async_start_pairing()
+                await asyncio.sleep(1)
+            except Exception:
+                _LOG.debug("Could not re-trigger PIN display")
+            return self._build_pin_screen(
+                "Pairing didn't complete - the TV did not issue an access token. "
+                "A new PIN is shown on the TV; please enter it."
+            )
+
+        _LOG.info("Access token persisted - pairing complete")
         await self._cleanup_pairing_client()
         return None

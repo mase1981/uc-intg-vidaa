@@ -30,25 +30,6 @@ _LOG = logging.getLogger(__name__)
 _MAC_PATTERN = re.compile(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
 
 
-def extract_mac_from_device_info(device_info: dict[str, Any] | None) -> str | None:
-    """Extract the real MAC address from a getdeviceinfo response.
-
-    The TV reports network_type as 'wlan' or 'eth', and the actual MAC
-    is stored under the interface name (e.g. 'wlan0', 'eth0').
-    """
-    if not device_info:
-        return None
-
-    network_type = device_info.get("network_type", "")
-    mac = device_info.get(f"{network_type}0")
-    if not mac:
-        mac = device_info.get("wlan0") or device_info.get("eth0")
-
-    if mac and _MAC_PATTERN.match(str(mac)):
-        return str(mac).upper().replace("-", ":")
-    return None
-
-
 class VidaaDevice(PollingDevice):
     """VIDAA TV implementation using PollingDevice."""
 
@@ -272,14 +253,15 @@ class VidaaDevice(PollingDevice):
         updates: dict[str, Any] = {}
         model = device_info.get("model_name")
         sw_version = device_info.get("tv_version")
-        mac = extract_mac_from_device_info(device_info)
 
         if model and model != self._device_config.model:
             updates["model"] = model
         if sw_version and sw_version != self._device_config.sw_version:
             updates["sw_version"] = sw_version
-        if mac and mac != self._device_config.mac:
-            updates["mac"] = mac
+
+        # The MAC is intentionally not updated here: it is the seed for dynamic
+        # MQTT credential generation, so it must stay identical to the value
+        # established during setup. Changing it would invalidate the session.
 
         if updates:
             self.update_config(**updates)
